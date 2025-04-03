@@ -36,14 +36,24 @@ class PoseAnalyzer:
         
         # 初始化YOLO模型
         self.yolo_model = YOLO('models/yolov8n-pose.pt')  # 使用YOLOv8姿态估计模型
+        self.ball_model = YOLO('models/yolov8n.pt')  # 使用YOLOv8物体检测模型
         if self.device == 'cuda':
             self.yolo_model.to('cuda')
+            self.ball_model.to('cuda')
         self.conf_threshold = 0.5
         
         # 性能优化参数
         self.min_person_size = 0.2
         self.max_person_size = 0.8
         self.frame_skip = 2  # 每处理2帧跳过1帧
+        
+        # 篮球检测参数
+        self.ball_tracking_history = []  # 存储球的运动轨迹
+        self.max_ball_history = 10  # 最大轨迹长度
+        self.ball_detection_threshold = 0.2  # 降低篮球检测置信度阈值
+        self.min_ball_movement = 0.05  # 降低最小球移动距离阈值
+        self.shooting_ball_speed = 0.1  # 降低投篮时球的移动速度阈值
+        self.ball_distance_threshold = 0.3  # 增加球与投篮手的距离阈值
 
     def calculate_angle_3d(self, a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
         """计算3D空间中的角度"""
@@ -157,8 +167,44 @@ class PoseAnalyzer:
         
         return None
 
-    def detect_shooting_action(self, results) -> Tuple[bool, str, float]:
-        """使用YOLO检测投篮动作"""
+    def detect_ball(self, frame: np.ndarray) -> Tuple[bool, List[float]]:
+        """检测篮球位置和运动"""
+        results = self.ball_model(frame, conf=self.ball_detection_threshold)
+        ball_detected = False
+        ball_position = None
+        
+        for result in results:
+            boxes = result.boxes
+            for box in boxes:
+                if box.cls == 32:  # YOLO中篮球的类别ID
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                    conf = box.conf[0].cpu().numpy()
+                    ball_position = [(x1 + x2) / 2, (y1 + y2) / 2, conf]
+                    ball_detected = True
+                    break
+            if ball_detected:
+                break
+        
+        # 更新球的运动轨迹
+        if ball_detected:
+            self.ball_tracking_history.append(ball_position)
+            if len(self.ball_tracking_history) > self.max_ball_history:
+                self.ball_tracking_history.pop(0)
+        
+        return ball_detected, ball_position
+
+    def is_ball_moving_upward(self) -> bool:
+        """判断球是否向上运动"""
+        if len(self.ball_tracking_history) < 2:
+            return False
+            
+        # 计算球的垂直移动速度
+        recent_positions = self.ball_tracking_history[-2:]
+        y_diff = recent_positions[1][1] - recent_positions[0][1]
+        return y_diff < -self.min_ball_movement  # 负值表示向上运动
+
+    def detect_shooting_action(self, results, ball_position: List[float]) -> Tuple[bool, str, float]:
+        """使用YOLO检测投篮动作，结合篮球位置"""
         if not results or not results[0].keypoints or len(results[0].keypoints.data) == 0:
             return False, None, 0.0
             
@@ -204,9 +250,25 @@ class PoseAnalyzer:
             is_shooting = False
             confidence = 0.0
             
-            if angle < 100 and angle > 60:
-                is_shooting = True
-                confidence = 1 - abs(angle - 90) / 90
+            # 检查肘部角度
+            if angle < 120 and angle > 40:  # 放宽角度范围
+                # 如果检测到篮球，检查球的位置
+                if ball_position:
+                    wrist_pos = wrist.cpu().numpy()
+                    ball_distance = np.sqrt(
+                        (wrist_pos[0] - ball_position[0])**2 +
+                        (wrist_pos[1] - ball_position[1])**2
+                    )
+                    
+                    # 如果球在投篮手附近或向上运动，认为是投篮动作
+                    if (ball_distance < self.ball_distance_threshold or 
+                        self.is_ball_moving_upward()):
+                        is_shooting = True
+                        confidence = 1 - abs(angle - 90) / 90
+                else:
+                    # 即使没有检测到篮球，只要肘部角度合适也认为是投篮动作
+                    is_shooting = True
+                    confidence = 1 - abs(angle - 90) / 90
                 
             return is_shooting, shooting_arm, confidence
             
@@ -389,8 +451,11 @@ class PoseAnalyzer:
                     # 使用YOLO进行姿态估计
                     results = self.yolo_model(frame, conf=self.conf_threshold)
                     
+                    # 检测篮球
+                    ball_detected, ball_position = self.detect_ball(frame)
+                    
                     # 检测投篮动作
-                    current_is_shooting, current_shooting_arm, confidence = self.detect_shooting_action(results)
+                    current_is_shooting, current_shooting_arm, confidence = self.detect_shooting_action(results, ball_position)
                     
                     # 更新身体朝向信息
                     if results and results[0].keypoints and len(results[0].keypoints.data) > 0:
@@ -425,6 +490,14 @@ class PoseAnalyzer:
                     
                     # 绘制结果
                     annotated_frame = frame.copy()
+                    
+                    # 绘制篮球位置
+                    if ball_detected:
+                        x, y, conf = ball_position
+                        cv2.circle(annotated_frame, (int(x), int(y)), 10, (0, 255, 0), -1)
+                        cv2.putText(annotated_frame, f"篮球 {conf:.2f}", (int(x), int(y) - 10),
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    
                     if results and results[0].keypoints and len(results[0].keypoints.data) > 0:
                         # 绘制关键点
                         for kp in results[0].keypoints.data[0]:
@@ -436,6 +509,7 @@ class PoseAnalyzer:
                         f"状态: {'投篮中' if is_shooting else '等待投篮'}",
                         f"投篮手: {'左手' if shooting_arm == 'left' else '右手' if shooting_arm else '未知'}",
                         f"朝向: {body_facing}" + (f" ({side_direction})" if body_facing == "side" else ""),
+                        f"篮球: {'已检测' if ball_detected else '未检测'}",
                         f"进度: {frame_count}/{total_frames}",
                         f"已检测投篮: {len(scores)}次"
                     ]
